@@ -1,10 +1,9 @@
-# Planning docs
 guide.md
 TASKLIST.md
 
 # Binaries
-recents
-recentsd
+/recents
+/recentsd
 /bin/
 /dist/
 
