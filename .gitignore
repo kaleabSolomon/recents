@@ -1,0 +1,38 @@
+# Planning docs
+guide.md
+TASKLIST.md
+
+# Binaries
+recents
+recentsd
+/bin/
+/dist/
+
+# Local runtime artifacts
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Local config and env
+.env
+.env.*
+!.env.example
+.config/
+
+# Logs and temp
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+
+# Go workspace artifacts
+.coverprofile
+coverage.out
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
