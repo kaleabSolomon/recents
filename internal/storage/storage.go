@@ -6,12 +6,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
+	"recents/internal/defaults"
 )
-
-const DefaultMaxEntries = 50000
 
 type Options struct {
 	Path       string
@@ -55,6 +55,16 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		return nil, fmt.Errorf("ping sqlite: %w", err)
 	}
 
+	db.SetMaxOpenConns(1)
+	if _, err := db.ExecContext(ctx, `PRAGMA journal_mode=WAL`); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("set journal mode: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, `PRAGMA synchronous=NORMAL`); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("set synchronous mode: %w", err)
+	}
+
 	if err := applyMigrations(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -62,7 +72,7 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 
 	maxEntries := opts.MaxEntries
 	if maxEntries <= 0 {
-		maxEntries = DefaultMaxEntries
+		maxEntries = defaults.MaxEntries
 	}
 
 	return &Store{db: db, maxEntries: maxEntries}, nil
@@ -74,6 +84,37 @@ func (s *Store) Close() error {
 
 func (s *Store) DB() *sql.DB {
 	return s.db
+}
+
+func (s *Store) UpsertOpen(ctx context.Context, path string, openedAt time.Time) error {
+	cleanPath, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return fmt.Errorf("normalize path %q: %w", path, err)
+	}
+
+	name := filepath.Base(cleanPath)
+	ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(cleanPath)), ".")
+	directory := filepath.Dir(cleanPath)
+	if openedAt.IsZero() {
+		openedAt = time.Now().UTC()
+	}
+
+	_, err = s.db.ExecContext(ctx, `
+INSERT INTO files(path, name, extension, last_opened, first_seen, open_count, directory)
+VALUES (?, ?, ?, ?, ?, 1, ?)
+ON CONFLICT(path) DO UPDATE SET
+	name = excluded.name,
+	extension = excluded.extension,
+	last_opened = excluded.last_opened,
+	open_count = files.open_count + 1,
+	directory = excluded.directory
+	-- first_seen intentionally omitted to preserve the original value
+`, cleanPath, name, ext, openedAt.UTC(), openedAt.UTC(), directory)
+	if err != nil {
+		return fmt.Errorf("upsert file open for %q: %w", cleanPath, err)
+	}
+
+	return nil
 }
 
 func (s *Store) Prune(ctx context.Context, maxEntries int) (int64, error) {

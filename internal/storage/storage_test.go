@@ -98,6 +98,54 @@ VALUES (?, ?, ?, ?, ?, ?, ?)`,
 	}
 }
 
+func TestUpsertOpenIncrementsCountAndPreservesFirstSeen(t *testing.T) {
+	t.Parallel()
+
+	store := openTestStore(t)
+	defer func() { _ = store.Close() }()
+
+	path := "/tmp/my-note.txt"
+	first := time.Date(2026, 3, 5, 12, 0, 0, 0, time.UTC)
+	second := first.Add(2 * time.Hour)
+
+	if err := store.UpsertOpen(context.Background(), path, first); err != nil {
+		t.Fatalf("first UpsertOpen() error = %v", err)
+	}
+	before := mustReadFileRow(t, store, path)
+	if before.OpenCount != 1 {
+		t.Fatalf("open_count after first upsert = %d, want 1", before.OpenCount)
+	}
+	if !before.FirstSeen.Equal(first) {
+		t.Fatalf("first_seen after first upsert = %v, want %v", before.FirstSeen, first)
+	}
+	if !before.LastOpened.Equal(first) {
+		t.Fatalf("last_opened after first upsert = %v, want %v", before.LastOpened, first)
+	}
+
+	if err := store.UpsertOpen(context.Background(), path, second); err != nil {
+		t.Fatalf("second UpsertOpen() error = %v", err)
+	}
+	after := mustReadFileRow(t, store, path)
+	if after.OpenCount != 2 {
+		t.Fatalf("open_count after second upsert = %d, want 2", after.OpenCount)
+	}
+	if !after.FirstSeen.Equal(first) {
+		t.Fatalf("first_seen after second upsert = %v, want %v", after.FirstSeen, first)
+	}
+	if !after.LastOpened.Equal(second) {
+		t.Fatalf("last_opened after second upsert = %v, want %v", after.LastOpened, second)
+	}
+	if after.Directory != "/tmp" {
+		t.Fatalf("directory = %q, want %q", after.Directory, "/tmp")
+	}
+	if after.Name != "my-note.txt" {
+		t.Fatalf("name = %q, want %q", after.Name, "my-note.txt")
+	}
+	if after.Extension != "txt" {
+		t.Fatalf("extension = %q, want %q", after.Extension, "txt")
+	}
+}
+
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
 
@@ -125,4 +173,39 @@ WHERE type = ? AND name = ?`,
 	if err != nil {
 		t.Fatalf("query sqlite_master for %s %q: %v", objectType, name, err)
 	}
+}
+
+type fileRow struct {
+	Name       string
+	Extension  string
+	LastOpened time.Time
+	FirstSeen  time.Time
+	OpenCount  int
+	Directory  string
+}
+
+func mustReadFileRow(t *testing.T, store *Store, path string) fileRow {
+	t.Helper()
+
+	absPath, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		t.Fatalf("normalize path %q: %v", path, err)
+	}
+
+	var row fileRow
+	err = store.DB().QueryRow(`
+SELECT name, extension, last_opened, first_seen, open_count, directory
+FROM files
+WHERE path = ?`, absPath).Scan(
+		&row.Name,
+		&row.Extension,
+		&row.LastOpened,
+		&row.FirstSeen,
+		&row.OpenCount,
+		&row.Directory,
+	)
+	if err != nil {
+		t.Fatalf("query row for path %q: %v", path, err)
+	}
+	return row
 }

@@ -9,9 +9,10 @@ import (
 	"strings"
 
 	"github.com/pelletier/go-toml/v2"
+	"recents/internal/defaults"
 )
 
-const DefaultMaxEntries = 50000
+const DefaultMaxEntries = defaults.MaxEntries
 
 type Config struct {
 	WatchPaths        []string `toml:"watch_paths"`
