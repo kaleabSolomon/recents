@@ -1,4 +1,4 @@
-.PHONY: fmt test lint build ci
+.PHONY: fmt test lint build ci perf
 
 fmt:
 	gofmt -w ./cmd ./internal
@@ -13,3 +13,6 @@ build:
 	go build ./...
 
 ci: fmt lint test build
+
+perf:
+	go test -bench . -benchmem ./...

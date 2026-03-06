@@ -176,6 +176,16 @@ var migrations = []migration{
 			return nil
 		},
 	},
+	{
+		version: 2,
+		name:    "add optimized query index for extension and recency",
+		apply: func(ctx context.Context, tx *sql.Tx) error {
+			if _, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_files_extension_last_opened ON files(extension, last_opened DESC)`); err != nil {
+				return err
+			}
+			return nil
+		},
+	},
 }
 
 func applyMigrations(ctx context.Context, db *sql.DB) error {

@@ -55,6 +55,8 @@ type model struct {
 	queryLimit   int
 	refreshing   bool
 	lastQueryDur time.Duration
+	startedAt    time.Time
+	startupDur   time.Duration
 }
 
 func newModel(store *storage.Store) model {
@@ -62,6 +64,7 @@ func newModel(store *storage.Store) model {
 		store:      store,
 		queryLimit: 500,
 		refreshing: true,
+		startedAt:  time.Now(),
 	}
 }
 
@@ -82,8 +85,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.records = msg.records
 		m.err = msg.err
 		m.lastQueryDur = msg.dur
+		if m.startupDur == 0 {
+			m.startupDur = time.Since(m.startedAt)
+		}
 		if msg.err != nil {
 			m.setStatusErr(msg.err)
+		} else if msg.dur > 20*time.Millisecond {
+			m.setStatus(fmt.Sprintf("Query slower than target: %s (>20ms)", msg.dur.Round(time.Millisecond)))
+		} else {
+			m.setStatus("")
 		}
 		if m.cursor >= len(m.records) {
 			m.cursor = max(0, len(m.records)-1)
@@ -199,13 +209,17 @@ func (m model) handleNormalModeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !ok {
 			return m, nil
 		}
-		return m, openPathCmd(rec.Path)
+		if rec.Missing {
+			m.setStatusErr(fmt.Errorf("file no longer exists: %s", rec.Path))
+			return m, nil
+		}
+		return m, openExistingPathCmd(rec.Path, false)
 	case "ctrl+o":
 		rec, ok := m.currentRecord()
 		if !ok {
 			return m, nil
 		}
-		return m, openPathCmd(rec.Directory)
+		return m, openExistingPathCmd(rec.Directory, true)
 	case "ctrl+c":
 		return m, tea.Quit
 	default:
@@ -243,7 +257,7 @@ func (m model) View() string {
 		if m.refreshing {
 			status = "Refreshing..."
 		} else {
-			status = fmt.Sprintf("Rows: %d  Query: %s", len(m.records), m.lastQueryDur.Round(time.Millisecond))
+			status = fmt.Sprintf("Rows: %d  Query: %s  Startup: %s", len(m.records), m.lastQueryDur.Round(time.Millisecond), m.startupDur.Round(time.Millisecond))
 		}
 	}
 	statusStyle := lipgloss.NewStyle()
@@ -284,6 +298,9 @@ func (m model) renderList() string {
 		name := rec.Name
 		if name == "" {
 			name = filepath.Base(rec.Path)
+		}
+		if rec.Missing {
+			name = "[missing] " + name
 		}
 		line := fmt.Sprintf("%s%-32s %-12s %s", prefix, truncate(name, 32), humanizeSince(rec.LastOpened), storage.FormatHomePath(rec.Directory))
 		if i == m.cursor {
@@ -352,8 +369,15 @@ func (m model) refreshCmd() tea.Cmd {
 	}
 }
 
-func openPathCmd(path string) tea.Cmd {
+func openExistingPathCmd(path string, requireDir bool) tea.Cmd {
 	return func() tea.Msg {
+		info, err := os.Stat(path)
+		if err != nil {
+			return actionResultMsg{err: fmt.Errorf("path unavailable %q: %w", path, err)}
+		}
+		if requireDir && !info.IsDir() {
+			return actionResultMsg{err: fmt.Errorf("not a directory: %q", path)}
+		}
 		cmd := exec.Command("xdg-open", path)
 		if err := cmd.Start(); err != nil {
 			return actionResultMsg{err: fmt.Errorf("open %q: %w", path, err)}
