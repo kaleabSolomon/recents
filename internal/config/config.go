@@ -76,7 +76,7 @@ func normalize(cfg Config) (Config, error) {
 
 	ignoredPaths := make([]string, 0, len(cfg.IgnoredPaths))
 	for _, p := range cfg.IgnoredPaths {
-		norm, err := normalizePath(p)
+		norm, err := normalizeIgnoredPath(p)
 		if err != nil {
 			return Config{}, fmt.Errorf("normalize ignored path %q: %w", p, err)
 		}
@@ -129,6 +129,23 @@ func normalizePath(p string) (string, error) {
 		return "", fmt.Errorf("resolve absolute path: %w", err)
 	}
 	return abs, nil
+}
+
+func normalizeIgnoredPath(p string) (string, error) {
+	trimmed := strings.TrimSpace(p)
+	if trimmed == "" {
+		return "", nil
+	}
+
+	if strings.HasPrefix(trimmed, "~") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve home dir: %w", err)
+		}
+		trimmed = filepath.Join(home, strings.TrimPrefix(trimmed, "~"))
+	}
+
+	return filepath.Clean(trimmed), nil
 }
 
 func normalizeExtensions(exts []string) []string {

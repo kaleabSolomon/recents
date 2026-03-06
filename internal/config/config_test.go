@@ -74,7 +74,7 @@ max_entries = 0
 		t.Fatalf("WatchPaths = %v, want %v", cfg.WatchPaths, expectedWatch)
 	}
 
-	expectedIgnored := []string{filepath.Join(tempDir, "tmp"), filepath.Join(tempDir, "node_modules")}
+	expectedIgnored := []string{"node_modules", "tmp"}
 	slices.Sort(expectedIgnored)
 	if !slices.Equal(cfg.IgnoredPaths, expectedIgnored) {
 		t.Fatalf("IgnoredPaths = %v, want %v", cfg.IgnoredPaths, expectedIgnored)
