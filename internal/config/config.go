@@ -23,10 +23,25 @@ type Config struct {
 
 func Default() Config {
 	return Config{
-		WatchPaths:        []string{"~/"},
-		IgnoredPaths:      []string{"node_modules", ".git", ".cache", "Downloads/tmp"},
-		TrackedExtensions: []string{"mkv", "mp4", "pdf", "txt", "go"},
-		MaxEntries:        DefaultMaxEntries,
+		WatchPaths: []string{"~/"},
+		IgnoredPaths: []string{
+			"node_modules",
+			".git",
+			".cache",
+			"Downloads/tmp",
+			"go/pkg/mod",
+			".cargo",
+			".npm",
+			".pnpm-store",
+			".local/share/nvim",
+			".config/Code",
+		},
+		TrackedExtensions: []string{
+			"mkv", "mp4", "avi", "mov", "webm",
+			"mp3", "flac", "wav", "ogg",
+			"pdf", "epub", "docx", "txt", "md",
+		},
+		MaxEntries: DefaultMaxEntries,
 	}
 }
 

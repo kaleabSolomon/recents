@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -31,6 +33,12 @@ type queryResultMsg struct {
 type actionResultMsg struct {
 	err error
 }
+
+type missingCheckMsg struct {
+	byID map[int64]bool
+}
+
+type clearStatusMsg struct{}
 
 type model struct {
 	store *storage.Store
@@ -99,13 +107,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cursor = max(0, len(m.records)-1)
 		}
 		m.ensureCursorVisible()
-		return m, nil
+		return m, checkMissingCmd(m.records)
 
 	case actionResultMsg:
 		if msg.err != nil {
 			m.setStatusErr(msg.err)
 		} else {
 			m.setStatus("Action completed")
+		}
+		return m, clearStatusAfterDelay()
+
+	case missingCheckMsg:
+		for i := range m.records {
+			m.records[i].Missing = msg.byID[m.records[i].ID]
+		}
+		return m, nil
+
+	case clearStatusMsg:
+		if !m.refreshing {
+			m.setStatus("")
 		}
 		return m, nil
 
@@ -218,6 +238,10 @@ func (m model) handleNormalModeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		rec, ok := m.currentRecord()
 		if !ok {
 			return m, nil
+		}
+		if rec.Missing {
+			m.setStatusErr(fmt.Errorf("directory no longer exists: %s", rec.Directory))
+			return m, clearStatusAfterDelay()
 		}
 		return m, openExistingPathCmd(rec.Directory, true)
 	case "ctrl+c":
@@ -386,6 +410,25 @@ func openExistingPathCmd(path string, requireDir bool) tea.Cmd {
 	}
 }
 
+func checkMissingCmd(records []storage.FileRecord) tea.Cmd {
+	recordsCopy := append([]storage.FileRecord(nil), records...)
+	return func() tea.Msg {
+		byID := make(map[int64]bool, len(recordsCopy))
+		for _, rec := range recordsCopy {
+			if _, err := os.Stat(rec.Path); err != nil {
+				byID[rec.ID] = true
+			}
+		}
+		return missingCheckMsg{byID: byID}
+	}
+}
+
+func clearStatusAfterDelay() tea.Cmd {
+	return tea.Tick(2*time.Second, func(time.Time) tea.Msg {
+		return clearStatusMsg{}
+	})
+}
+
 func parseFilter(raw string) []string {
 	filter := strings.TrimSpace(strings.ToLower(raw))
 	if filter == "" {
@@ -471,7 +514,10 @@ func max(a, b int) int {
 }
 
 func main() {
-	store, err := storage.Open(context.Background(), storage.Options{})
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	store, err := storage.Open(ctx, storage.Options{})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "recents: %v\n", err)
 		os.Exit(1)

@@ -2,9 +2,7 @@ package storage
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -87,15 +85,6 @@ FROM files`
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate recent file rows: %w", err)
-	}
-
-	for i := range results {
-		if _, err := os.Stat(results[i].Path); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				results[i].Missing = true
-				continue
-			}
-		}
 	}
 
 	return results, nil
