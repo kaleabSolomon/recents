@@ -29,6 +29,7 @@ func Default() Config {
 			".git",
 			".cache",
 			"Downloads/tmp",
+			".local/share/Trash",
 			"go/pkg/mod",
 			".cargo",
 			".npm",
@@ -40,6 +41,7 @@ func Default() Config {
 			"mkv", "mp4", "avi", "mov", "webm",
 			"mp3", "flac", "wav", "ogg",
 			"pdf", "epub", "docx", "txt", "md",
+			"png", "jpg", "jpeg", "gif", "webp",
 		},
 		MaxEntries: DefaultMaxEntries,
 	}

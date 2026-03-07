@@ -28,6 +28,7 @@ type queryResultMsg struct {
 	records []storage.FileRecord
 	err     error
 	dur     time.Duration
+	id      int
 }
 
 type actionResultMsg struct {
@@ -39,6 +40,7 @@ type missingCheckMsg struct {
 }
 
 type clearStatusMsg struct{}
+type heartbeatMsg time.Time
 
 type model struct {
 	store *storage.Store
@@ -65,6 +67,8 @@ type model struct {
 	lastQueryDur time.Duration
 	startedAt    time.Time
 	startupDur   time.Duration
+	lastQueryID  int
+	tickCount    int
 }
 
 func newModel(store *storage.Store) model {
@@ -77,7 +81,11 @@ func newModel(store *storage.Store) model {
 }
 
 func (m model) Init() tea.Cmd {
-	return m.refreshCmd()
+	m.lastQueryID++
+	return tea.Batch(
+		m.refreshCmd(m.lastQueryID),
+		heartbeatCmd(),
+	)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -89,6 +97,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case queryResultMsg:
+		if msg.id != m.lastQueryID {
+			return m, nil
+		}
 		m.refreshing = false
 		m.records = msg.records
 		m.err = msg.err
@@ -129,6 +140,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case heartbeatMsg:
+		m.tickCount++
+		cmds := []tea.Cmd{heartbeatCmd()}
+		// Poll DB periodically so new opens appear without manual refresh.
+		if m.tickCount%2 == 0 && !m.refreshing {
+			m.refreshing = true
+			m.lastQueryID++
+			cmds = append(cmds, m.refreshCmd(m.lastQueryID))
+		}
+		return m, tea.Batch(cmds...)
+
 	case tea.KeyMsg:
 		if m.mode != modeNormal {
 			return m.handleInputModeKey(msg)
@@ -141,6 +163,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) handleInputModeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
+	case tea.KeyUp:
+		if m.cursor > 0 {
+			m.cursor--
+		}
+		m.ensureCursorVisible()
+		return m, nil
+	case tea.KeyDown:
+		if m.cursor < len(m.records)-1 {
+			m.cursor++
+		}
+		m.ensureCursorVisible()
+		return m, nil
 	case tea.KeyEsc:
 		if m.mode == modeFilter {
 			m.filter = ""
@@ -148,32 +182,51 @@ func (m model) handleInputModeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.mode = modeNormal
 		m.refreshing = true
-		return m, m.refreshCmd()
+		m.lastQueryID++
+		return m, m.refreshCmd(m.lastQueryID)
 	case tea.KeyEnter:
-		if m.mode == modeSearch {
-			m.search = strings.TrimSpace(m.searchInput)
-		} else {
-			m.filter = strings.TrimSpace(m.filterInput)
-		}
+		// Live mode already applies query while typing. Enter just exits edit mode.
 		m.mode = modeNormal
-		m.refreshing = true
-		return m, m.refreshCmd()
+		return m, nil
 	case tea.KeyBackspace, tea.KeyDelete:
 		if m.mode == modeSearch {
 			m.searchInput = trimLastRune(m.searchInput)
+			m.search = strings.TrimSpace(m.searchInput)
 		} else {
 			m.filterInput = trimLastRune(m.filterInput)
+			m.filter = strings.TrimSpace(m.filterInput)
 		}
-		return m, nil
+		m.refreshing = true
+		m.lastQueryID++
+		return m, m.refreshCmd(m.lastQueryID)
 	case tea.KeyCtrlC:
 		return m, tea.Quit
 	default:
+		switch msg.String() {
+		case "j":
+			if m.cursor < len(m.records)-1 {
+				m.cursor++
+			}
+			m.ensureCursorVisible()
+			return m, nil
+		case "k":
+			if m.cursor > 0 {
+				m.cursor--
+			}
+			m.ensureCursorVisible()
+			return m, nil
+		}
 		if msg.Type == tea.KeyRunes {
 			if m.mode == modeSearch {
 				m.searchInput += string(msg.Runes)
+				m.search = strings.TrimSpace(m.searchInput)
 			} else {
 				m.filterInput += string(msg.Runes)
+				m.filter = strings.TrimSpace(m.filterInput)
 			}
+			m.refreshing = true
+			m.lastQueryID++
+			return m, m.refreshCmd(m.lastQueryID)
 		}
 		return m, nil
 	}
@@ -206,8 +259,15 @@ func (m model) handleNormalModeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.ensureCursorVisible()
 		return m, nil
 	case "r":
+		fallthrough
+	case "R":
+		fallthrough
+	case "u":
+		fallthrough
+	case "ctrl+r":
 		m.refreshing = true
-		return m, m.refreshCmd()
+		m.lastQueryID++
+		return m, m.refreshCmd(m.lastQueryID)
 	case "/":
 		m.mode = modeSearch
 		m.searchInput = m.search
@@ -221,7 +281,8 @@ func (m model) handleNormalModeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.filter = ""
 			m.filterInput = ""
 			m.refreshing = true
-			return m, m.refreshCmd()
+			m.lastQueryID++
+			return m, m.refreshCmd(m.lastQueryID)
 		}
 		return m, nil
 	case "enter":
@@ -273,7 +334,7 @@ func (m model) View() string {
 
 	list := m.renderList()
 
-	help := "j/k,↑/↓ move  g/G top/bottom  Enter open  Ctrl+o folder  / search  f filter  Esc clear filter  r refresh  q quit"
+	help := "j/k,↑/↓ move  g/G top/bottom  Enter open  Ctrl+o folder  / search  f filter  Esc clear filter  r/u/R/Ctrl+r refresh  q quit"
 	helpLine := lipgloss.NewStyle().Faint(true).Render(help)
 
 	status := m.status
@@ -376,7 +437,7 @@ func (m *model) setStatusErr(err error) {
 	m.statusErr = true
 }
 
-func (m model) refreshCmd() tea.Cmd {
+func (m model) refreshCmd(id int) tea.Cmd {
 	search := m.search
 	extensions := parseFilter(m.filter)
 	limit := m.queryLimit
@@ -389,7 +450,7 @@ func (m model) refreshCmd() tea.Cmd {
 			Extensions: extensions,
 			Limit:      limit,
 		})
-		return queryResultMsg{records: records, err: err, dur: time.Since(started)}
+		return queryResultMsg{records: records, err: err, dur: time.Since(started), id: id}
 	}
 }
 
@@ -426,6 +487,12 @@ func checkMissingCmd(records []storage.FileRecord) tea.Cmd {
 func clearStatusAfterDelay() tea.Cmd {
 	return tea.Tick(2*time.Second, func(time.Time) tea.Msg {
 		return clearStatusMsg{}
+	})
+}
+
+func heartbeatCmd() tea.Cmd {
+	return tea.Tick(1*time.Second, func(t time.Time) tea.Msg {
+		return heartbeatMsg(t)
 	})
 }
 
