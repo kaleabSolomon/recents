@@ -73,15 +73,15 @@ type model struct {
 
 func newModel(store *storage.Store) model {
 	return model{
-		store:      store,
-		queryLimit: 500,
-		refreshing: true,
-		startedAt:  time.Now(),
+		store:       store,
+		queryLimit:  500,
+		refreshing:  true,
+		startedAt:   time.Now(),
+		lastQueryID: 1,
 	}
 }
 
 func (m model) Init() tea.Cmd {
-	m.lastQueryID++
 	return tea.Batch(
 		m.refreshCmd(m.lastQueryID),
 		heartbeatCmd(),

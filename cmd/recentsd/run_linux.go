@@ -3,14 +3,17 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"log"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -20,30 +23,21 @@ import (
 	"recents/internal/storage"
 )
 
-const (
-	inotifyMask = unix.IN_OPEN |
-		unix.IN_CREATE |
-		unix.IN_MOVED_TO |
-		unix.IN_MOVED_FROM |
-		unix.IN_DELETE_SELF |
-		unix.IN_MOVE_SELF |
-		unix.IN_IGNORED |
-		unix.IN_Q_OVERFLOW |
-		unix.IN_ONLYDIR
-)
-
-type linuxInotifyEvent struct {
-	wd    int
-	path  string
-	mask  uint32
-	isDir bool
+type fanOpenEvent struct {
+	path string
+	pid  int
 }
 
-type recursiveInotifyWatcher struct {
-	fd       int
-	wdToPath map[int]string
-	pathToWd map[string]int
-	ignored  []string
+type fanotifyWatcher struct {
+	fd          int
+	watchRoots  []string
+	mountPoints []string
+}
+
+type pidBurstGate struct {
+	window    time.Duration
+	maxEvents int
+	seen      map[int][]time.Time
 }
 
 func run(ctx context.Context) error {
@@ -52,20 +46,19 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	watcher, err := newRecursiveInotifyWatcher(cfg.IgnoredPaths)
+	roots, err := normalizeWatchRoots(cfg.WatchPaths)
 	if err != nil {
-		return fmt.Errorf("create inotify watcher: %w", err)
+		return err
+	}
+
+	watcher, err := newFanotifyWatcher(roots)
+	if err != nil {
+		if errors.Is(err, syscall.EPERM) {
+			return fmt.Errorf("fanotify requires elevated privileges (run recentsd with sudo/root): %w", err)
+		}
+		return fmt.Errorf("create fanotify watcher: %w", err)
 	}
 	defer watcher.Close()
-
-	for _, watchPath := range cfg.WatchPaths {
-		if err := watcher.addRecursive(watchPath); err != nil {
-			log.Printf("recentsd level=warn component=watcher action=init_watch root=%q err=%v", watchPath, err)
-			if isWatchLimitErr(err) {
-				logWatchLimitHint()
-			}
-		}
-	}
 
 	store, err := storage.Open(ctx, storage.Options{MaxEntries: cfg.MaxEntries})
 	if err != nil {
@@ -78,6 +71,7 @@ func run(ctx context.Context) error {
 		MaxEntries:     cfg.MaxEntries,
 	})
 	filter := newFileFilter(cfg.TrackedExtensions, cfg.IgnoredPaths)
+	burstGate := newPIDBurstGate(1200*time.Millisecond, 2)
 
 	eventQueue := make(chan ingest.Event, 2048)
 
@@ -125,7 +119,7 @@ func run(ctx context.Context) error {
 		events, err := watcher.readEvents()
 		if err != nil {
 			if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EINTR) {
-				time.Sleep(25 * time.Millisecond)
+				time.Sleep(20 * time.Millisecond)
 				continue
 			}
 			log.Printf("recentsd level=warn component=watcher action=read err=%v", err)
@@ -136,147 +130,89 @@ func run(ctx context.Context) error {
 			continue
 		}
 
-		if len(events) == 0 {
-			time.Sleep(25 * time.Millisecond)
-			continue
-		}
-
+		now := time.Now().UTC()
 		for _, ev := range events {
-			if ev.mask&unix.IN_Q_OVERFLOW != 0 {
-				log.Printf("recentsd level=warn component=watcher msg=%q", "inotify queue overflow; some events were dropped")
+			if !pathUnderRoots(ev.path, roots) {
 				continue
 			}
-
-			if ev.mask&unix.IN_IGNORED != 0 {
-				watcher.removeByWD(ev.wd)
+			if !isLikelyUserInitiatedOpen(ev.pid) {
 				continue
 			}
-
-			if ev.isDir && (ev.mask&unix.IN_CREATE != 0 || ev.mask&unix.IN_MOVED_TO != 0) {
-				if err := watcher.addRecursive(ev.path); err != nil {
-					log.Printf("recentsd level=warn component=watcher action=add_recursive path=%q err=%v", ev.path, err)
-					if isWatchLimitErr(err) {
-						logWatchLimitHint()
-					}
-				}
+			if !burstGate.Allow(ev.pid, now) {
 				continue
 			}
-
-			if ev.isDir && (ev.mask&unix.IN_MOVED_FROM != 0 || ev.mask&unix.IN_DELETE_SELF != 0 || ev.mask&unix.IN_MOVE_SELF != 0) {
-				watcher.removeTree(ev.path)
+			if !shouldTrackFile(ev.path, filter) {
 				continue
 			}
-
-			if ev.mask&unix.IN_OPEN != 0 && !ev.isDir {
-				if !shouldTrackFile(ev.path, filter) {
-					continue
-				}
-				select {
-				case eventQueue <- ingest.Event{Path: ev.path, OpenedAt: time.Now().UTC()}:
-				default:
-					log.Printf("recentsd level=warn component=queue action=drop path=%q reason=full", ev.path)
-				}
+			select {
+			case eventQueue <- ingest.Event{Path: ev.path, OpenedAt: now}:
+			default:
+				log.Printf("recentsd level=warn component=queue action=drop path=%q reason=full", ev.path)
 			}
 		}
 	}
 }
 
-func newRecursiveInotifyWatcher(ignored []string) (*recursiveInotifyWatcher, error) {
-	fd, err := unix.InotifyInit1(unix.IN_NONBLOCK | unix.IN_CLOEXEC)
+func newPIDBurstGate(window time.Duration, maxEvents int) *pidBurstGate {
+	return &pidBurstGate{
+		window:    window,
+		maxEvents: maxEvents,
+		seen:      make(map[int][]time.Time, 256),
+	}
+}
+
+func (g *pidBurstGate) Allow(pid int, at time.Time) bool {
+	if pid <= 0 {
+		return false
+	}
+	cutoff := at.Add(-g.window)
+	history := g.seen[pid][:0]
+	for _, ts := range g.seen[pid] {
+		if ts.After(cutoff) {
+			history = append(history, ts)
+		}
+	}
+	if len(history) >= g.maxEvents {
+		g.seen[pid] = history
+		return false
+	}
+	history = append(history, at)
+	g.seen[pid] = history
+	return true
+}
+
+func newFanotifyWatcher(watchRoots []string) (*fanotifyWatcher, error) {
+	fd, err := unix.FanotifyInit(
+		unix.FAN_CLASS_NOTIF|unix.FAN_CLOEXEC|unix.FAN_NONBLOCK|unix.FAN_UNLIMITED_MARKS|unix.FAN_UNLIMITED_QUEUE,
+		unix.O_RDONLY|unix.O_LARGEFILE,
+	)
 	if err != nil {
 		return nil, err
 	}
-	return &recursiveInotifyWatcher{
-		fd:       fd,
-		wdToPath: make(map[int]string, 4096),
-		pathToWd: make(map[string]int, 4096),
-		ignored:  ignored,
-	}, nil
+
+	mounts, err := mountPointsForRoots(watchRoots)
+	if err != nil {
+		_ = unix.Close(fd)
+		return nil, err
+	}
+
+	for _, mp := range mounts {
+		err := unix.FanotifyMark(fd, unix.FAN_MARK_ADD|unix.FAN_MARK_MOUNT, unix.FAN_OPEN, unix.AT_FDCWD, mp)
+		if err != nil {
+			_ = unix.Close(fd)
+			return nil, fmt.Errorf("fanotify mark %q: %w", mp, err)
+		}
+	}
+
+	return &fanotifyWatcher{fd: fd, watchRoots: watchRoots, mountPoints: mounts}, nil
 }
 
-func (w *recursiveInotifyWatcher) Close() error {
+func (w *fanotifyWatcher) Close() error {
 	return unix.Close(w.fd)
 }
 
-func (w *recursiveInotifyWatcher) addRecursive(root string) error {
-	cleanRoot, err := filepath.Abs(filepath.Clean(root))
-	if err != nil {
-		return fmt.Errorf("normalize watch root %q: %w", root, err)
-	}
-
-	return filepath.WalkDir(cleanRoot, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			if errors.Is(err, fs.ErrPermission) {
-				log.Printf("recentsd level=warn component=watcher action=walk path=%q reason=permission_denied", path)
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if !d.IsDir() {
-			return nil
-		}
-		if isIgnoredPath(path, w.ignored) {
-			return filepath.SkipDir
-		}
-		if err := w.addWatch(path); err != nil {
-			if errors.Is(err, fs.ErrPermission) {
-				log.Printf("recentsd level=warn component=watcher action=add path=%q reason=permission_denied", path)
-				return filepath.SkipDir
-			}
-			if isWatchLimitErr(err) {
-				return err
-			}
-			log.Printf("recentsd level=warn component=watcher action=add path=%q err=%v", path, err)
-		}
-		return nil
-	})
-}
-
-func (w *recursiveInotifyWatcher) addWatch(path string) error {
-	cleanPath, err := filepath.Abs(filepath.Clean(path))
-	if err != nil {
-		return err
-	}
-	if _, exists := w.pathToWd[cleanPath]; exists {
-		return nil
-	}
-
-	wd, err := unix.InotifyAddWatch(w.fd, cleanPath, inotifyMask)
-	if err != nil {
-		return err
-	}
-
-	w.wdToPath[wd] = cleanPath
-	w.pathToWd[cleanPath] = wd
-	return nil
-}
-
-func (w *recursiveInotifyWatcher) removeByWD(wd int) {
-	path, ok := w.wdToPath[wd]
-	if !ok {
-		return
-	}
-	delete(w.wdToPath, wd)
-	delete(w.pathToWd, path)
-}
-
-func (w *recursiveInotifyWatcher) removeTree(root string) {
-	root = filepath.Clean(root)
-	prefix := root + string(filepath.Separator)
-	toRemove := make([]int, 0, 16)
-	for path, wd := range w.pathToWd {
-		if path == root || strings.HasPrefix(path, prefix) {
-			toRemove = append(toRemove, wd)
-		}
-	}
-	for _, wd := range toRemove {
-		_, _ = unix.InotifyRmWatch(w.fd, uint32(wd))
-		w.removeByWD(wd)
-	}
-}
-
-func (w *recursiveInotifyWatcher) readEvents() ([]linuxInotifyEvent, error) {
-	buf := make([]byte, 256*unix.SizeofInotifyEvent+4096)
+func (w *fanotifyWatcher) readEvents() ([]fanOpenEvent, error) {
+	buf := make([]byte, 64*1024)
 	n, err := unix.Read(w.fd, buf)
 	if err != nil {
 		return nil, err
@@ -285,32 +221,236 @@ func (w *recursiveInotifyWatcher) readEvents() ([]linuxInotifyEvent, error) {
 		return nil, nil
 	}
 
-	events := make([]linuxInotifyEvent, 0, 64)
+	events := make([]fanOpenEvent, 0, 64)
+	metaSize := int(unsafe.Sizeof(unix.FanotifyEventMetadata{}))
 	offset := 0
-	for offset+unix.SizeofInotifyEvent <= n {
-		raw := (*unix.InotifyEvent)(unsafe.Pointer(&buf[offset]))
-		offset += unix.SizeofInotifyEvent
-
-		name := ""
-		if raw.Len > 0 {
-			nameBytes := buf[offset : offset+int(raw.Len)]
-			name = strings.TrimRight(string(nameBytes), "\x00")
-			offset += int(raw.Len)
+	for offset+metaSize <= n {
+		meta := (*unix.FanotifyEventMetadata)(unsafe.Pointer(&buf[offset]))
+		if meta.Event_len < uint32(metaSize) {
+			break
 		}
 
-		basePath := w.wdToPath[int(raw.Wd)]
-		eventPath := basePath
-		if name != "" {
-			eventPath = filepath.Join(basePath, name)
+		eventLen := int(meta.Event_len)
+		if meta.Vers != unix.FANOTIFY_METADATA_VERSION {
+			offset += eventLen
+			continue
 		}
 
-		events = append(events, linuxInotifyEvent{
-			wd:    int(raw.Wd),
-			path:  eventPath,
-			mask:  raw.Mask,
-			isDir: raw.Mask&unix.IN_ISDIR != 0,
-		})
+		if meta.Mask&unix.FAN_Q_OVERFLOW != 0 {
+			log.Printf("recentsd level=warn component=watcher msg=%q", "fanotify queue overflow; some events were dropped")
+			offset += eventLen
+			continue
+		}
+
+		if meta.Fd >= 0 && (meta.Mask&unix.FAN_OPEN != 0) {
+			path, pathErr := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", meta.Fd))
+			_ = unix.Close(int(meta.Fd))
+			if pathErr == nil && path != "" {
+				events = append(events, fanOpenEvent{path: filepath.Clean(path), pid: int(meta.Pid)})
+			}
+		}
+
+		offset += eventLen
 	}
 
 	return events, nil
+}
+
+func normalizeWatchRoots(paths []string) ([]string, error) {
+	out := make([]string, 0, len(paths))
+	seen := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		abs, err := filepath.Abs(filepath.Clean(p))
+		if err != nil {
+			return nil, fmt.Errorf("normalize watch path %q: %w", p, err)
+		}
+		if _, ok := seen[abs]; ok {
+			continue
+		}
+		seen[abs] = struct{}{}
+		out = append(out, abs)
+	}
+	return out, nil
+}
+
+func pathUnderRoots(path string, roots []string) bool {
+	path = filepath.Clean(path)
+	sep := string(filepath.Separator)
+	for _, root := range roots {
+		if path == root || strings.HasPrefix(path, root+sep) {
+			return true
+		}
+	}
+	return false
+}
+
+func isLikelyUserInitiatedOpen(pid int) bool {
+	if pid <= 1 || pid == os.Getpid() {
+		return false
+	}
+
+	procPath := fmt.Sprintf("/proc/%d", pid)
+	st, err := os.Stat(procPath)
+	if err != nil {
+		return false
+	}
+	statT, ok := st.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	if int(statT.Uid) != targetUID() {
+		return false
+	}
+
+	commBytes, err := os.ReadFile(filepath.Join(procPath, "comm"))
+	if err != nil {
+		return false
+	}
+	comm := strings.TrimSpace(strings.ToLower(string(commBytes)))
+	if comm == "" {
+		return false
+	}
+	if _, blocked := backgroundProcessBlocklist[comm]; blocked {
+		return false
+	}
+
+	// Keep processes tied to interactive shells/terminals.
+	if hasTTY(pid) {
+		return true
+	}
+	// Keep GUI apps from current session.
+	if hasSessionDisplayEnv(pid) {
+		return true
+	}
+
+	return false
+}
+
+func targetUID() int {
+	// When running via sudo, still attribute opens to the invoking user.
+	if sudoUID := strings.TrimSpace(os.Getenv("SUDO_UID")); sudoUID != "" {
+		if uid, err := strconv.Atoi(sudoUID); err == nil {
+			return uid
+		}
+	}
+	return os.Getuid()
+}
+
+var backgroundProcessBlocklist = map[string]struct{}{
+	"tracker-miner-fs-3": {},
+	"tracker-extract-3":  {},
+	"baloo_file":         {},
+	"updatedb":           {},
+	"locate":             {},
+	"gvfsd-metadata":     {},
+	"kdeconnectd":        {},
+	"kio-fuse":           {},
+	"recentsd":           {},
+}
+
+func hasTTY(pid int) bool {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return false
+	}
+	line := string(data)
+	end := strings.LastIndex(line, ")")
+	if end == -1 || end+2 >= len(line) {
+		return false
+	}
+	fields := strings.Fields(line[end+2:])
+	if len(fields) < 5 {
+		return false
+	}
+	ttyNR, err := strconv.Atoi(fields[4])
+	if err != nil {
+		return false
+	}
+	return ttyNR != 0
+}
+
+func hasSessionDisplayEnv(pid int) bool {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
+	if err != nil {
+		return false
+	}
+	env := string(data)
+	return strings.Contains(env, "DISPLAY=") || strings.Contains(env, "WAYLAND_DISPLAY=")
+}
+
+func mountPointsForRoots(roots []string) ([]string, error) {
+	mounts, err := listMountPoints()
+	if err != nil {
+		return nil, err
+	}
+
+	seen := make(map[string]struct{})
+	result := make([]string, 0, len(roots))
+	for _, root := range roots {
+		mp := bestMountPoint(root, mounts)
+		if mp == "" {
+			continue
+		}
+		if _, ok := seen[mp]; ok {
+			continue
+		}
+		seen[mp] = struct{}{}
+		result = append(result, mp)
+	}
+	if len(result) == 0 {
+		return nil, errors.New("no mount points resolved for watch roots")
+	}
+	return result, nil
+}
+
+func listMountPoints() ([]string, error) {
+	f, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		return nil, fmt.Errorf("open mountinfo: %w", err)
+	}
+	defer f.Close()
+
+	replacer := strings.NewReplacer(`\\040`, " ", `\\011`, "\t", `\\012`, "\n", `\\134`, `\\`)
+	result := make([]string, 0, 64)
+	s := bufio.NewScanner(f)
+	for s.Scan() {
+		line := s.Text()
+		left := strings.SplitN(line, " - ", 2)[0]
+		fields := strings.Fields(left)
+		if len(fields) < 5 {
+			continue
+		}
+		mp := filepath.Clean(replacer.Replace(fields[4]))
+		result = append(result, mp)
+	}
+	if err := s.Err(); err != nil {
+		return nil, fmt.Errorf("scan mountinfo: %w", err)
+	}
+	return result, nil
+}
+
+func bestMountPoint(path string, mounts []string) string {
+	path = filepath.Clean(path)
+	best := ""
+	for _, mp := range mounts {
+		if path == mp {
+			if len(mp) > len(best) {
+				best = mp
+			}
+			continue
+		}
+		if mp == string(filepath.Separator) {
+			// Root mount is a parent of all absolute paths.
+			if strings.HasPrefix(path, string(filepath.Separator)) && len(mp) > len(best) {
+				best = mp
+			}
+			continue
+		}
+		if strings.HasPrefix(path, mp+string(filepath.Separator)) {
+			if len(mp) > len(best) {
+				best = mp
+			}
+		}
+	}
+	return best
 }
