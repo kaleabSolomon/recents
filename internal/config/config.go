@@ -10,6 +10,7 @@ import (
 
 	"github.com/pelletier/go-toml/v2"
 	"recents/internal/defaults"
+	"recents/internal/identity"
 )
 
 const DefaultMaxEntries = defaults.MaxEntries
@@ -48,9 +49,9 @@ func Default() Config {
 }
 
 func DefaultPath() (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := identity.HomeDir()
 	if err != nil {
-		return "", fmt.Errorf("resolve home dir: %w", err)
+		return "", err
 	}
 	return filepath.Join(home, ".config", "recents", "config.toml"), nil
 }
@@ -129,9 +130,9 @@ func normalizePath(p string) (string, error) {
 	}
 
 	if strings.HasPrefix(trimmed, "~") {
-		home, err := os.UserHomeDir()
+		home, err := identity.HomeDir()
 		if err != nil {
-			return "", fmt.Errorf("resolve home dir: %w", err)
+			return "", err
 		}
 		trimmed = filepath.Join(home, strings.TrimPrefix(trimmed, "~"))
 	}
@@ -155,9 +156,9 @@ func normalizeIgnoredPath(p string) (string, error) {
 	}
 
 	if strings.HasPrefix(trimmed, "~") {
-		home, err := os.UserHomeDir()
+		home, err := identity.HomeDir()
 		if err != nil {
-			return "", fmt.Errorf("resolve home dir: %w", err)
+			return "", err
 		}
 		trimmed = filepath.Join(home, strings.TrimPrefix(trimmed, "~"))
 	}

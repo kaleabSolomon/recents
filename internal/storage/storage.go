@@ -11,6 +11,7 @@ import (
 
 	_ "modernc.org/sqlite"
 	"recents/internal/defaults"
+	"recents/internal/identity"
 )
 
 type Options struct {
@@ -24,9 +25,9 @@ type Store struct {
 }
 
 func DefaultPath() (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := identity.HomeDir()
 	if err != nil {
-		return "", fmt.Errorf("resolve home dir: %w", err)
+		return "", err
 	}
 	return filepath.Join(home, ".local", "share", "recents", "recents.db"), nil
 }
