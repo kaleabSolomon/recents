@@ -203,20 +203,6 @@ func (m model) handleInputModeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyCtrlC:
 		return m, tea.Quit
 	default:
-		switch msg.String() {
-		case "j":
-			if m.cursor < len(m.records)-1 {
-				m.cursor++
-			}
-			m.ensureCursorVisible()
-			return m, nil
-		case "k":
-			if m.cursor > 0 {
-				m.cursor--
-			}
-			m.ensureCursorVisible()
-			return m, nil
-		}
 		if msg.Type == tea.KeyRunes {
 			if m.mode == modeSearch {
 				m.searchInput += string(msg.Runes)
@@ -315,15 +301,15 @@ func (m model) handleNormalModeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 var (
-	textStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("247"))           // Gray
-	accentStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("51")).Bold(true) // Bright Cyan
-	subtleStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("239"))           // Darker Gray
+	textStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("247"))                                            // Gray
+	accentStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("51")).Bold(true)                                  // Bright Cyan
+	subtleStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("239"))                                            // Darker Gray
 	highlightStyle   = lipgloss.NewStyle().Background(lipgloss.Color("23")).Foreground(lipgloss.Color("51")).Bold(true) // Dark Cyan BG, Bright Cyan FG
-	titleStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("43")).Bold(true).Margin(0, 1)                   // Light Cyan
-	boxStyle         = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("24"))    // Dark Teal
-	activeBoxStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("37"))    // Medium Cyan
-	dirStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("38"))                                           // Deep Cyan
-	timeStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("73"))                                           // Muted Cyan
+	titleStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("43")).Bold(true).Margin(0, 1)                     // Light Cyan
+	boxStyle         = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("24"))      // Dark Teal
+	activeBoxStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("37"))      // Medium Cyan
+	dirStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("38"))                                             // Deep Cyan
+	timeStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("73"))                                             // Muted Cyan
 	tableHeaderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("37")).Bold(true).BorderBottom(true).BorderStyle(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("24"))
 	errorStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("160")).Bold(true) // Darker Red
 )
@@ -367,7 +353,7 @@ func (m model) View() string {
 	filterBlock := lipgloss.JoinHorizontal(lipgloss.Center, filterLabel, filterContent)
 
 	headerItems := lipgloss.JoinHorizontal(lipgloss.Center, title, subtleStyle.Render(" | "), searchBlock, subtleStyle.Render(" | "), filterBlock)
-	
+
 	headerBox := boxStyle.Width(m.width - 2).Render(headerItems)
 	if m.mode == modeSearch || m.mode == modeFilter {
 		headerBox = activeBoxStyle.Width(m.width - 2).Render(headerItems)
@@ -428,10 +414,10 @@ func (m model) View() string {
 		visible := m.listVisibleRows()
 		end := min(len(m.records), m.top+visible)
 		lines := make([]string, 0, end-m.top)
-		
+
 		for i := m.top; i < end; i++ {
 			rec := m.records[i]
-			
+
 			cursor := "  "
 			if i == m.cursor {
 				cursor = accentStyle.Render("▶ ")
@@ -463,15 +449,15 @@ func (m model) View() string {
 				rDirStyle = subtleStyle
 			}
 
-			row := fmt.Sprintf("%s%s   %s   %s", 
-				cursor, 
-				rowStyle.Render(fmt.Sprintf("%-*s", fileWidth, dispName)), 
-				rTimeStyle.Render(fmt.Sprintf("%-*s", ageWidth, dispAge)), 
+			row := fmt.Sprintf("%s%s   %s   %s",
+				cursor,
+				rowStyle.Render(fmt.Sprintf("%-*s", fileWidth, dispName)),
+				rTimeStyle.Render(fmt.Sprintf("%-*s", ageWidth, dispAge)),
 				rDirStyle.Render(fmt.Sprintf("%-*s", dirWidth, dispDir)),
 			)
 			lines = append(lines, row)
 		}
-		
+
 		padRows := visible - len(lines)
 		for j := 0; j < padRows; j++ {
 			lines = append(lines, "")
@@ -484,14 +470,14 @@ func (m model) View() string {
 	if m.mode == modeNormal {
 		mainBoxStyle = activeBoxStyle
 	}
-	
+
 	mainBox := mainBoxStyle.Width(m.width - 2).Height(listHeight).Render(listContent)
 
 	return lipgloss.JoinVertical(lipgloss.Left, headerBox, mainBox, footerBox)
 }
 
 func (m model) listVisibleRows() int {
-	// m.height total = header(3) + footer(3) + mainBox(listHeight+2 borders). 
+	// m.height total = header(3) + footer(3) + mainBox(listHeight+2 borders).
 	// List internal space = listHeight
 	// Top header line in list = 1
 	// Visible rows = listHeight - 1
