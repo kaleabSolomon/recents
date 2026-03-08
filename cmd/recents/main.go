@@ -11,9 +11,10 @@ import (
 	"syscall"
 	"time"
 
+	"recents/internal/storage"
+
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"recents/internal/storage"
 )
 
 type inputMode int
@@ -277,9 +278,10 @@ func (m model) handleNormalModeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.filterInput = m.filter
 		return m, nil
 	case "esc":
-		if m.filter != "" {
+		if m.filter != "" || m.mode != modeNormal {
 			m.filter = ""
 			m.filterInput = ""
+			m.mode = modeNormal
 			m.refreshing = true
 			m.lastQueryID++
 			return m, m.refreshCmd(m.lastQueryID)
@@ -312,30 +314,71 @@ func (m model) handleNormalModeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
+var (
+	textStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("247"))           // Gray
+	accentStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("51")).Bold(true) // Bright Cyan
+	subtleStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("239"))           // Darker Gray
+	highlightStyle   = lipgloss.NewStyle().Background(lipgloss.Color("23")).Foreground(lipgloss.Color("51")).Bold(true) // Dark Cyan BG, Bright Cyan FG
+	titleStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("43")).Bold(true).Margin(0, 1)                   // Light Cyan
+	boxStyle         = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("24"))    // Dark Teal
+	activeBoxStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("37"))    // Medium Cyan
+	dirStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("38"))                                           // Deep Cyan
+	timeStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("73"))                                           // Muted Cyan
+	tableHeaderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("37")).Bold(true).BorderBottom(true).BorderStyle(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("24"))
+	errorStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("160")).Bold(true) // Darker Red
+)
+
 func (m model) View() string {
-	title := lipgloss.NewStyle().Bold(true).Render("Recents")
-	searchValue := m.search
+	if m.width == 0 || m.height == 0 {
+		return "Initializing..."
+	}
+
+	searchVal := m.search
 	if m.mode == modeSearch {
-		searchValue = m.searchInput + "_"
+		searchVal = m.searchInput + "█"
 	}
-	filterValue := m.filter
+	if searchVal == "" {
+		searchVal = "..."
+	}
+
+	filterVal := m.filter
 	if m.mode == modeFilter {
-		filterValue = m.filterInput + "_"
+		filterVal = m.filterInput + "█"
 	}
-	if searchValue == "" {
-		searchValue = "(none)"
-	}
-	if filterValue == "" {
-		filterValue = "(none)"
+	if filterVal == "" {
+		filterVal = "..."
 	}
 
-	meta := fmt.Sprintf("Search: %s   Filter: %s", searchValue, filterValue)
-	metaLine := lipgloss.NewStyle().Faint(true).Render(meta)
+	// === HEADER ===
+	title := titleStyle.Render("⚡ recents")
 
-	list := m.renderList()
+	searchLabel := textStyle.Render("Search ")
+	searchContent := accentStyle.Render(searchVal)
+	if m.mode == modeSearch {
+		searchContent = highlightStyle.Render(" " + searchVal + " ")
+	}
+	searchBlock := lipgloss.JoinHorizontal(lipgloss.Center, searchLabel, searchContent)
 
-	help := "j/k,↑/↓ move  g/G top/bottom  Enter open  Ctrl+o folder  / search  f filter  Esc clear filter  r/u/R/Ctrl+r refresh  q quit"
-	helpLine := lipgloss.NewStyle().Faint(true).Render(help)
+	filterLabel := textStyle.Render("Filter ")
+	filterContent := accentStyle.Render(filterVal)
+	if m.mode == modeFilter {
+		filterContent = highlightStyle.Render(" " + filterVal + " ")
+	}
+	filterBlock := lipgloss.JoinHorizontal(lipgloss.Center, filterLabel, filterContent)
+
+	headerItems := lipgloss.JoinHorizontal(lipgloss.Center, title, subtleStyle.Render(" | "), searchBlock, subtleStyle.Render(" | "), filterBlock)
+	
+	headerBox := boxStyle.Width(m.width - 2).Render(headerItems)
+	if m.mode == modeSearch || m.mode == modeFilter {
+		headerBox = activeBoxStyle.Width(m.width - 2).Render(headerItems)
+	}
+
+	// === FOOTER ===
+	helpText := ""
+	keys := []string{"j/k,↑/↓", "move", "g/G", "top/bot", "Enter", "open", "Ctrl+o", "folder", "/", "search", "f", "filter", "Esc", "clear", "r", "refresh", "q", "quit"}
+	for i := 0; i < len(keys); i += 2 {
+		helpText += accentStyle.Render(keys[i]) + subtleStyle.Render(" "+keys[i+1]+"  ")
+	}
 
 	status := m.status
 	if status == "" {
@@ -345,66 +388,118 @@ func (m model) View() string {
 			status = fmt.Sprintf("Rows: %d  Query: %s  Startup: %s", len(m.records), m.lastQueryDur.Round(time.Millisecond), m.startupDur.Round(time.Millisecond))
 		}
 	}
-	statusStyle := lipgloss.NewStyle()
+	renderedStatus := subtleStyle.Render(status)
 	if m.statusErr {
-		statusStyle = statusStyle.Foreground(lipgloss.Color("9"))
-	} else {
-		statusStyle = statusStyle.Faint(true)
+		renderedStatus = errorStyle.Render(status)
 	}
 
-	return strings.Join([]string{
-		title,
-		metaLine,
-		"",
-		list,
-		"",
-		helpLine,
-		statusStyle.Render(status),
-	}, "\n")
-}
+	footerInner := lipgloss.JoinHorizontal(lipgloss.Bottom, helpText, strings.Repeat(" ", max(0, m.width-4-lipgloss.Width(helpText)-lipgloss.Width(renderedStatus))), renderedStatus)
+	footerBox := boxStyle.Width(m.width - 2).Render(footerInner)
 
-func (m model) renderList() string {
+	// === LIST BODY ===
+	listHeight := m.height - lipgloss.Height(headerBox) - lipgloss.Height(footerBox) - 2 // -2 for borders
+	if listHeight < 0 {
+		listHeight = 0
+	}
+
+	var listContent string
 	if m.err != nil {
-		return lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Render("Error: " + m.err.Error())
-	}
-	if len(m.records) == 0 {
-		return lipgloss.NewStyle().Faint(true).Render("No recent files matched your query.")
+		listContent = errorStyle.Render("Error: " + m.err.Error())
+	} else if len(m.records) == 0 {
+		listContent = subtleStyle.Render("\n  No recent files matched your query.")
+	} else {
+		// Calculate column widths
+		avSpace := m.width - 4 // border + padding
+		ageWidth := 11
+		dirWidth := avSpace / 3
+		if dirWidth > 40 {
+			dirWidth = 40
+		}
+		if dirWidth < 15 {
+			dirWidth = 15
+		}
+		fileWidth := avSpace - ageWidth - dirWidth - 6 // margins
+
+		// Table Header
+		thLine := fmt.Sprintf("  %-*s   %-*s   %s", fileWidth, "FILE", ageWidth, "AGE", "DIRECTORY")
+		listContent = tableHeaderStyle.Render(thLine) + "\n"
+
+		// Rows
+		visible := m.listVisibleRows()
+		end := min(len(m.records), m.top+visible)
+		lines := make([]string, 0, end-m.top)
+		
+		for i := m.top; i < end; i++ {
+			rec := m.records[i]
+			
+			cursor := "  "
+			if i == m.cursor {
+				cursor = accentStyle.Render("▶ ")
+			}
+
+			name := rec.Name
+			if name == "" {
+				name = filepath.Base(rec.Path)
+			}
+			if rec.Missing {
+				name = "❌ " + name
+			}
+
+			dispName := truncate(name, fileWidth)
+			dispAge := humanizeSince(rec.LastOpened)
+			dispDir := truncate(storage.FormatHomePath(rec.Directory), dirWidth)
+
+			rowStyle := textStyle
+			rTimeStyle := timeStyle
+			rDirStyle := dirStyle
+
+			if i == m.cursor {
+				rowStyle = highlightStyle
+				rTimeStyle = highlightStyle
+				rDirStyle = highlightStyle
+			} else if rec.Missing {
+				rowStyle = subtleStyle
+				rTimeStyle = subtleStyle
+				rDirStyle = subtleStyle
+			}
+
+			row := fmt.Sprintf("%s%s   %s   %s", 
+				cursor, 
+				rowStyle.Render(fmt.Sprintf("%-*s", fileWidth, dispName)), 
+				rTimeStyle.Render(fmt.Sprintf("%-*s", ageWidth, dispAge)), 
+				rDirStyle.Render(fmt.Sprintf("%-*s", dirWidth, dispDir)),
+			)
+			lines = append(lines, row)
+		}
+		
+		padRows := visible - len(lines)
+		for j := 0; j < padRows; j++ {
+			lines = append(lines, "")
+		}
+
+		listContent += strings.Join(lines, "\n")
 	}
 
-	visible := m.listVisibleRows()
-	end := min(len(m.records), m.top+visible)
-	lines := make([]string, 0, end-m.top)
-	for i := m.top; i < end; i++ {
-		rec := m.records[i]
-		prefix := "  "
-		if i == m.cursor {
-			prefix = "> "
-		}
-		name := rec.Name
-		if name == "" {
-			name = filepath.Base(rec.Path)
-		}
-		if rec.Missing {
-			name = "[missing] " + name
-		}
-		line := fmt.Sprintf("%s%-32s %-12s %s", prefix, truncate(name, 32), humanizeSince(rec.LastOpened), storage.FormatHomePath(rec.Directory))
-		if i == m.cursor {
-			line = lipgloss.NewStyle().Bold(true).Render(line)
-		}
-		lines = append(lines, line)
+	mainBoxStyle := boxStyle
+	if m.mode == modeNormal {
+		mainBoxStyle = activeBoxStyle
 	}
-	return strings.Join(lines, "\n")
+	
+	mainBox := mainBoxStyle.Width(m.width - 2).Height(listHeight).Render(listContent)
+
+	return lipgloss.JoinVertical(lipgloss.Left, headerBox, mainBox, footerBox)
 }
 
 func (m model) listVisibleRows() int {
-	if m.height <= 0 {
-		return 10
+	// m.height total = header(3) + footer(3) + mainBox(listHeight+2 borders). 
+	// List internal space = listHeight
+	// Top header line in list = 1
+	// Visible rows = listHeight - 1
+	listHeight := m.height - 8
+	if listHeight < 5 {
+		listHeight = 5
 	}
-	rows := m.height - 8
-	if rows < 5 {
-		rows = 5
-	}
-	return rows
+	return listHeight - 1 // subtract table header
 }
 
 func (m *model) ensureCursorVisible() {

@@ -17,11 +17,13 @@ func TestRenderListMarksMissingFiles(t *testing.T) {
 		records: []storage.FileRecord{
 			{Name: "gone.txt", Directory: "/tmp", LastOpened: time.Now().Add(-time.Minute), Missing: true},
 		},
+		width:  80,
+		height: 40,
 	}
 
-	view := m.renderList()
-	if !strings.Contains(view, "[missing]") {
-		t.Fatalf("expected [missing] marker in list view, got %q", view)
+	view := m.View()
+	if !strings.Contains(view, "❌ gone.txt") {
+		t.Fatalf("expected ❌ marker in list view, got \n%s", view)
 	}
 }
 
