@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -19,6 +20,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"recents/internal/config"
+	"recents/internal/identity"
 	"recents/internal/ingest"
 	"recents/internal/storage"
 )
@@ -59,6 +61,17 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("open storage: %w", err)
 	}
 	defer store.Close()
+
+	// Opens are attributed to this uid (RECENTS_USER under systemd, SUDO_UID
+	// under sudo). When the daemon runs as root, hand the database files to
+	// that user so the unprivileged TUI can open them (WAL needs -shm write
+	// access even for readers).
+	attributedUID := identity.UID()
+	if attributedUID != os.Getuid() {
+		if err := chownStorageToUser(attributedUID); err != nil {
+			log.Printf("recentsd level=warn component=storage action=chown uid=%d err=%v", attributedUID, err)
+		}
+	}
 
 	processor := ingest.NewProcessor(store, ingest.Options{
 		DebounceWindow: ingest.DefaultDebounceWindow,
@@ -158,7 +171,7 @@ func run(ctx context.Context) error {
 			if !shouldTrackFile(ev.path, filter) {
 				continue
 			}
-			if !isLikelyUserInitiatedOpen(ev.pid) {
+			if !isLikelyUserInitiatedOpen(ev.pid, attributedUID) {
 				continue
 			}
 			gate.Add(ev.pid, ev.path, now)
@@ -273,7 +286,7 @@ func pathUnderRoots(path string, roots []string) bool {
 	return false
 }
 
-func isLikelyUserInitiatedOpen(pid int) bool {
+func isLikelyUserInitiatedOpen(pid, attributedUID int) bool {
 	if pid <= 1 || pid == os.Getpid() {
 		return false
 	}
@@ -287,7 +300,7 @@ func isLikelyUserInitiatedOpen(pid int) bool {
 	if !ok {
 		return false
 	}
-	if int(statT.Uid) != targetUID() {
+	if int(statT.Uid) != attributedUID {
 		return false
 	}
 
@@ -315,14 +328,29 @@ func isLikelyUserInitiatedOpen(pid int) bool {
 	return false
 }
 
-func targetUID() int {
-	// When running via sudo, still attribute opens to the invoking user.
-	if sudoUID := strings.TrimSpace(os.Getenv("SUDO_UID")); sudoUID != "" {
-		if uid, err := strconv.Atoi(sudoUID); err == nil {
-			return uid
+// chownStorageToUser hands the database directory and files over to the
+// attributed user so the TUI, running unprivileged, can open them.
+func chownStorageToUser(uid int) error {
+	u, err := user.LookupId(strconv.Itoa(uid))
+	if err != nil {
+		return fmt.Errorf("lookup uid %d: %w", uid, err)
+	}
+	gid, err := strconv.Atoi(u.Gid)
+	if err != nil {
+		return fmt.Errorf("parse gid %q: %w", u.Gid, err)
+	}
+
+	dbPath, err := storage.DefaultPath()
+	if err != nil {
+		return err
+	}
+
+	for _, p := range []string{filepath.Dir(dbPath), dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		if err := os.Chown(p, uid, gid); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("chown %q: %w", p, err)
 		}
 	}
-	return os.Getuid()
+	return nil
 }
 
 // commMaxLen is the kernel's TASK_COMM_LEN minus the NUL terminator:

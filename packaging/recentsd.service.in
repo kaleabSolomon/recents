@@ -1,0 +1,16 @@
+[Unit]
+Description=recents - tracks files opened by @USER@
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=@BINDIR@/recentsd
+# fanotify and /proc attribution require root. Opens are attributed to
+# RECENTS_USER, and the database lives in that user's home
+# (~/.local/share/recents/recents.db).
+Environment=RECENTS_USER=@USER@
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
