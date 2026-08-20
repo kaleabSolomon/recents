@@ -1,51 +1,47 @@
 # recents
 
-A "recently opened files" tracker for the Linux terminal — like the Recent
-Files view in Windows Explorer, but for everything you open, in a TUI.
+Recently opened files, in your terminal. A daemon watches file opens
+system-wide (fanotify), keeps only the ones *you* made — media, documents,
+images — and a TUI lists them. Like the Windows Explorer "Recent files" view,
+for everything.
 
-A root daemon (`recentsd`) watches file opens system-wide via fanotify,
-filters them down to files *you* deliberately opened (media, documents,
-images by default), and records them in SQLite. The `recents` TUI shows the
-list — searchable, filterable, and able to reopen a file or its folder.
+Which episode was I on? `recents` → top of the list.
 
-Typical use: "which episode was I on?" — open `recents`, the file at the top
-of the list is your answer.
+Linux only.
 
-## Install (always-on daemon)
+## Install
+
+Requires Go 1.23+ and systemd.
 
 ```sh
-sudo make install      # builds, installs to /usr/local/bin, enables systemd unit
-systemctl status recentsd
+git clone https://github.com/kaleabSolomon/recents.git
+cd recents
+sudo make install
 ```
 
-The unit tracks the user who ran `sudo make install`. For a different user:
-`sudo make install RECENTS_USER=name`. Remove everything with
-`sudo make uninstall`.
+That builds both binaries, installs them to `/usr/local/bin`, and starts the
+`recentsd` service tracking the user who ran the command
+(`RECENTS_USER=name` to override). `sudo make uninstall` removes everything.
 
-To run the daemon by hand instead: `sudo ./bin/recentsd` (sudo attribution
-works via SUDO_UID).
-
-## TUI
+## Use
 
 ```sh
 recents
 ```
 
-| Key | Action |
+| Key | |
 | --- | --- |
-| `j`/`k`, arrows | move |
-| `g` / `G` | top / bottom |
-| `Enter` | open file (xdg-open) |
-| `Ctrl+o` | open containing folder |
-| `/` | live search by name |
-| `f` | filter by extension (`mkv,mp4`) or category (`video`, `audio`, `documents`, `images`, `code`) |
-| `Esc` | clear filter / exit input |
-| `r` | refresh (also auto-refreshes every 2s) |
+| `j`/`k` `g`/`G` | move / top / bottom |
+| `Enter` / `Ctrl+o` | open file / its folder |
+| `/` | search |
+| `f` | filter: `mkv,mp4` or `video` `audio` `documents` `images` `code` |
+| `d` | folder view — latest file per directory |
+| `Esc` | clear |
 | `q` | quit |
 
 ## Config
 
-`~/.config/recents/config.toml` (all optional):
+`~/.config/recents/config.toml` — optional, defaults shown trimmed:
 
 ```toml
 watch_paths = ["~/"]
@@ -54,23 +50,13 @@ tracked_extensions = ["mkv", "mp4", "pdf", "epub", "png", "jpg"]
 max_entries = 50000
 ```
 
-## How opens are filtered
-
-fanotify reports every open on the watched mounts, so the daemon filters
-aggressively; an open is recorded only if:
-
-- the path is under `watch_paths`, not ignored, and has a tracked extension
-- the opening process belongs to you and has a terminal or a display session
-  (background indexers, thumbnailers, and daemons are rejected)
-- the process isn't mass-opening files: opens are held for ~2s, and a process
-  that opens more than 3 distinct tracked files in that window has the whole
-  burst discarded (repeat opens of the same file don't count)
-
-Net effect: a file appears in the TUI a few seconds after you open it.
+An open is recorded only if the path matches the config, the opening process
+is yours with a terminal or display session (indexers and thumbnailers are
+rejected), and it isn't part of a mass-open burst. Files appear a few seconds
+after you open them.
 
 ## Development
 
 ```sh
-make ci     # fmt + vet + test + build
-make perf   # benchmarks
+make ci    # fmt + vet + test + build
 ```

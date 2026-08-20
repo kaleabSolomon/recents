@@ -61,6 +61,7 @@ type model struct {
 	searchInput  string
 	filter       string
 	filterInput  string
+	grouped      bool
 	status       string
 	statusErr    bool
 	queryLimit   int
@@ -263,6 +264,13 @@ func (m model) handleNormalModeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.mode = modeFilter
 		m.filterInput = m.filter
 		return m, nil
+	case "d":
+		m.grouped = !m.grouped
+		m.cursor = 0
+		m.top = 0
+		m.refreshing = true
+		m.lastQueryID++
+		return m, m.refreshCmd(m.lastQueryID)
 	case "esc":
 		if m.filter != "" || m.mode != modeNormal {
 			m.filter = ""
@@ -352,7 +360,13 @@ func (m model) View() string {
 	}
 	filterBlock := lipgloss.JoinHorizontal(lipgloss.Center, filterLabel, filterContent)
 
-	headerItems := lipgloss.JoinHorizontal(lipgloss.Center, title, subtleStyle.Render(" | "), searchBlock, subtleStyle.Render(" | "), filterBlock)
+	viewVal := "files"
+	if m.grouped {
+		viewVal = "folders"
+	}
+	viewBlock := lipgloss.JoinHorizontal(lipgloss.Center, textStyle.Render("View "), accentStyle.Render(viewVal))
+
+	headerItems := lipgloss.JoinHorizontal(lipgloss.Center, title, subtleStyle.Render(" | "), searchBlock, subtleStyle.Render(" | "), filterBlock, subtleStyle.Render(" | "), viewBlock)
 
 	headerBox := boxStyle.Width(m.width - 2).Render(headerItems)
 	if m.mode == modeSearch || m.mode == modeFilter {
@@ -361,7 +375,7 @@ func (m model) View() string {
 
 	// === FOOTER ===
 	helpText := ""
-	keys := []string{"j/k,↑/↓", "move", "g/G", "top/bot", "Enter", "open", "Ctrl+o", "folder", "/", "search", "f", "filter", "Esc", "clear", "r", "refresh", "q", "quit"}
+	keys := []string{"j/k,↑/↓", "move", "g/G", "top/bot", "Enter", "open", "Ctrl+o", "folder", "/", "search", "f", "filter", "d", "folders", "Esc", "clear", "r", "refresh", "q", "quit"}
 	for i := 0; i < len(keys); i += 2 {
 		helpText += accentStyle.Render(keys[i]) + subtleStyle.Render(" "+keys[i+1]+"  ")
 	}
@@ -436,7 +450,13 @@ func (m model) View() string {
 
 			dispName := truncate(name, fileWidth)
 			dispAge := humanizeSince(rec.LastOpened)
-			dispDir := truncate(storage.FormatHomePath(rec.Directory), dirWidth)
+			dir := storage.FormatHomePath(rec.Directory)
+			dispDir := truncate(dir, dirWidth)
+			if m.grouped && rec.GroupCount > 1 {
+				// Keep the file count visible even when the path is truncated.
+				suffix := fmt.Sprintf(" (%d)", rec.GroupCount)
+				dispDir = truncate(dir, max(1, dirWidth-len(suffix))) + suffix
+			}
 
 			rowStyle := textStyle
 			rTimeStyle := timeStyle
@@ -525,6 +545,7 @@ func (m model) refreshCmd(id int) tea.Cmd {
 	search := m.search
 	extensions := parseFilter(m.filter)
 	limit := m.queryLimit
+	grouped := m.grouped
 	store := m.store
 
 	return func() tea.Msg {
@@ -533,6 +554,7 @@ func (m model) refreshCmd(id int) tea.Cmd {
 			Search:     search,
 			Extensions: extensions,
 			Limit:      limit,
+			GroupByDir: grouped,
 		})
 		return queryResultMsg{records: records, err: err, dur: time.Since(started), id: id}
 	}

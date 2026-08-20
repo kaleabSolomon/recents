@@ -18,12 +18,18 @@ type FileRecord struct {
 	OpenCount  int
 	Directory  string
 	Missing    bool
+	// GroupCount is the number of matching files in the same directory.
+	// Populated only for grouped queries; zero otherwise.
+	GroupCount int
 }
 
 type QueryOptions struct {
 	Search     string
 	Extensions []string
 	Limit      int
+	// GroupByDir collapses results to one row per directory: its most
+	// recently opened matching file, with GroupCount set.
+	GroupByDir bool
 }
 
 func (s *Store) ListRecent(ctx context.Context, opts QueryOptions) ([]FileRecord, error) {
@@ -38,6 +44,15 @@ func (s *Store) ListRecent(ctx context.Context, opts QueryOptions) ([]FileRecord
 	query := `
 SELECT id, path, name, extension, last_opened, first_seen, open_count, directory
 FROM files`
+	if opts.GroupByDir {
+		// SQLite's bare-column semantics with MAX() guarantee the non-aggregate
+		// columns come from the row holding the maximum last_opened. The MAX()
+		// itself is selected only to trigger that rule (aggregates lose the
+		// column's declared type, so we scan the bare column instead).
+		query = `
+SELECT id, path, name, extension, last_opened, first_seen, open_count, directory, COUNT(*), MAX(last_opened)
+FROM files`
+	}
 	var where []string
 	var args []any
 
@@ -57,6 +72,9 @@ FROM files`
 	if len(where) > 0 {
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
+	if opts.GroupByDir {
+		query += " GROUP BY directory"
+	}
 	query += " ORDER BY last_opened DESC, id DESC LIMIT ?"
 	args = append(args, limit)
 
@@ -69,7 +87,7 @@ FROM files`
 	results := make([]FileRecord, 0, limit)
 	for rows.Next() {
 		var rec FileRecord
-		if err := rows.Scan(
+		dest := []any{
 			&rec.ID,
 			&rec.Path,
 			&rec.Name,
@@ -78,7 +96,12 @@ FROM files`
 			&rec.FirstSeen,
 			&rec.OpenCount,
 			&rec.Directory,
-		); err != nil {
+		}
+		if opts.GroupByDir {
+			var maxIgnored any
+			dest = append(dest, &rec.GroupCount, &maxIgnored)
+		}
+		if err := rows.Scan(dest...); err != nil {
 			return nil, fmt.Errorf("scan recent file row: %w", err)
 		}
 		results = append(results, rec)
