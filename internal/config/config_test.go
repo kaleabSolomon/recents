@@ -68,7 +68,14 @@ max_entries = 0
 		t.Fatalf("UserHomeDir() error = %v", err)
 	}
 
-	expectedWatch := []string{filepath.Join(home, "work"), filepath.Join(tempDir, "rel")}
+	// Relative paths resolve against the physical working directory, so
+	// resolve symlinks (macOS: /var -> /private/var) in the expectation.
+	resolvedTemp, err := filepath.EvalSymlinks(tempDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks() error = %v", err)
+	}
+
+	expectedWatch := []string{filepath.Join(home, "work"), filepath.Join(resolvedTemp, "rel")}
 	slices.Sort(expectedWatch)
 	if !slices.Equal(cfg.WatchPaths, expectedWatch) {
 		t.Fatalf("WatchPaths = %v, want %v", cfg.WatchPaths, expectedWatch)

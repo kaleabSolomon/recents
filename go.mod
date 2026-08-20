@@ -5,8 +5,8 @@ go 1.23.0
 require (
 	github.com/charmbracelet/bubbletea v1.3.4
 	github.com/charmbracelet/lipgloss v1.1.0
-	github.com/fsnotify/fsnotify v1.9.0
 	github.com/pelletier/go-toml/v2 v2.2.4
+	golang.org/x/sys v0.34.0
 	modernc.org/sqlite v1.38.2
 )
 
@@ -32,7 +32,6 @@ require (
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b // indirect
 	golang.org/x/sync v0.15.0 // indirect
-	golang.org/x/sys v0.34.0 // indirect
 	golang.org/x/text v0.3.8 // indirect
 	modernc.org/libc v1.66.3 // indirect
 	modernc.org/mathutil v1.7.1 // indirect

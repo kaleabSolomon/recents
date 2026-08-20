@@ -405,6 +405,9 @@ func (m model) View() string {
 			dirWidth = 15
 		}
 		fileWidth := avSpace - ageWidth - dirWidth - 6 // margins
+		if fileWidth < 10 {
+			fileWidth = 10
+		}
 
 		// Table Header
 		thLine := fmt.Sprintf("  %-*s   %-*s   %s", fileWidth, "FILE", ageWidth, "AGE", "DIRECTORY")
@@ -634,12 +637,12 @@ func trimLastRune(s string) string {
 }
 
 func truncate(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
 	r := []rune(s)
 	if len(r) <= width {
 		return s
-	}
-	if width <= 1 {
-		return string(r[:width])
 	}
 	if width <= 3 {
 		return string(r[:width])

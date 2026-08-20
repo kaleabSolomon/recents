@@ -34,12 +34,6 @@ type fanotifyWatcher struct {
 	mountPoints []string
 }
 
-type pidBurstGate struct {
-	window    time.Duration
-	maxEvents int
-	seen      map[int][]time.Time
-}
-
 func run(ctx context.Context) error {
 	cfg, err := config.Load("")
 	if err != nil {
@@ -71,7 +65,9 @@ func run(ctx context.Context) error {
 		MaxEntries:     cfg.MaxEntries,
 	})
 	filter := newFileFilter(cfg.TrackedExtensions, cfg.IgnoredPaths)
-	burstGate := newPIDBurstGate(1200*time.Millisecond, 2)
+	// Tracked opens are held for the gate's window so that mass-open bursts
+	// (indexers, thumbnailers, app startup scans) can be dropped in full.
+	gate := newOpenGate(2*time.Second, 3, 5*time.Second)
 
 	eventQueue := make(chan ingest.Event, 2048)
 
@@ -91,9 +87,29 @@ func run(ctx context.Context) error {
 		}
 	}()
 
+	enqueue := func(released []gateEvent) {
+		for _, ev := range released {
+			select {
+			case eventQueue <- ingest.Event{Path: ev.path, OpenedAt: ev.at}:
+			default:
+				log.Printf("recentsd level=warn component=queue action=drop path=%q reason=full", ev.path)
+			}
+		}
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
+			// Release any held opens directly so the user's last actions are
+			// not lost; the queue worker is exiting on ctx.Done.
+			shutdownCtx, cancelIngest := context.WithTimeout(context.Background(), 2*time.Second)
+			for _, ev := range gate.FlushAll() {
+				if _, err := processor.Ingest(shutdownCtx, ingest.Event{Path: ev.path, OpenedAt: ev.at}); err != nil {
+					log.Printf("recentsd level=warn component=ingest action=final_flush path=%q err=%v", ev.path, err)
+				}
+			}
+			cancelIngest()
+
 			waitDone := make(chan struct{})
 			go func() {
 				wg.Wait()
@@ -119,6 +135,7 @@ func run(ctx context.Context) error {
 		events, err := watcher.readEvents()
 		if err != nil {
 			if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EINTR) {
+				enqueue(gate.Flush(time.Now().UTC()))
 				time.Sleep(20 * time.Millisecond)
 				continue
 			}
@@ -132,53 +149,22 @@ func run(ctx context.Context) error {
 
 		now := time.Now().UTC()
 		for _, ev := range events {
+			// Cheap path checks first; the /proc attribution checks run only
+			// for files that would actually be recorded, so app startup noise
+			// (dotfiles, caches, fonts) never reaches the burst gate.
 			if !pathUnderRoots(ev.path, roots) {
-				continue
-			}
-			if !isLikelyUserInitiatedOpen(ev.pid) {
-				continue
-			}
-			if !burstGate.Allow(ev.pid, now) {
 				continue
 			}
 			if !shouldTrackFile(ev.path, filter) {
 				continue
 			}
-			select {
-			case eventQueue <- ingest.Event{Path: ev.path, OpenedAt: now}:
-			default:
-				log.Printf("recentsd level=warn component=queue action=drop path=%q reason=full", ev.path)
+			if !isLikelyUserInitiatedOpen(ev.pid) {
+				continue
 			}
+			gate.Add(ev.pid, ev.path, now)
 		}
+		enqueue(gate.Flush(now))
 	}
-}
-
-func newPIDBurstGate(window time.Duration, maxEvents int) *pidBurstGate {
-	return &pidBurstGate{
-		window:    window,
-		maxEvents: maxEvents,
-		seen:      make(map[int][]time.Time, 256),
-	}
-}
-
-func (g *pidBurstGate) Allow(pid int, at time.Time) bool {
-	if pid <= 0 {
-		return false
-	}
-	cutoff := at.Add(-g.window)
-	history := g.seen[pid][:0]
-	for _, ts := range g.seen[pid] {
-		if ts.After(cutoff) {
-			history = append(history, ts)
-		}
-	}
-	if len(history) >= g.maxEvents {
-		g.seen[pid] = history
-		return false
-	}
-	history = append(history, at)
-	g.seen[pid] = history
-	return true
 }
 
 func newFanotifyWatcher(watchRoots []string) (*fanotifyWatcher, error) {
@@ -242,12 +228,15 @@ func (w *fanotifyWatcher) readEvents() ([]fanOpenEvent, error) {
 			continue
 		}
 
-		if meta.Fd >= 0 && (meta.Mask&unix.FAN_OPEN != 0) {
-			path, pathErr := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", meta.Fd))
-			_ = unix.Close(int(meta.Fd))
-			if pathErr == nil && path != "" {
-				events = append(events, fanOpenEvent{path: filepath.Clean(path), pid: int(meta.Pid)})
+		if meta.Fd >= 0 {
+			if meta.Mask&unix.FAN_OPEN != 0 {
+				path, pathErr := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", meta.Fd))
+				if pathErr == nil && path != "" {
+					events = append(events, fanOpenEvent{path: filepath.Clean(path), pid: int(meta.Pid)})
+				}
 			}
+			// Always close the event fd, even for masks we don't handle.
+			_ = unix.Close(int(meta.Fd))
 		}
 
 		offset += eventLen
@@ -336,17 +325,50 @@ func targetUID() int {
 	return os.Getuid()
 }
 
-var backgroundProcessBlocklist = map[string]struct{}{
-	"tracker-miner-fs-3": {},
-	"tracker-extract-3":  {},
-	"baloo_file":         {},
-	"updatedb":           {},
-	"locate":             {},
-	"gvfsd-metadata":     {},
-	"kdeconnectd":        {},
-	"kio-fuse":           {},
-	"recentsd":           {},
+// commMaxLen is the kernel's TASK_COMM_LEN minus the NUL terminator:
+// /proc/PID/comm is truncated to at most 15 characters.
+const commMaxLen = 15
+
+func truncateComm(s string) string {
+	if len(s) > commMaxLen {
+		return s[:commMaxLen]
+	}
+	return s
 }
+
+// backgroundProcessBlocklist holds comm names (truncated to the kernel's
+// 15-char limit) of indexers, thumbnailers, and other background scanners
+// whose opens must never be recorded.
+var backgroundProcessBlocklist = func() map[string]struct{} {
+	names := []string{
+		"recentsd",
+		// Indexers
+		"tracker-miner-fs-3",
+		"tracker-extract-3",
+		"localsearch-3",
+		"baloo_file",
+		"baloo_file_extractor",
+		"updatedb",
+		"plocate-build",
+		"locate",
+		"gvfsd-metadata",
+		// Thumbnailers
+		"tumblerd",
+		"evince-thumbnailer",
+		"totem-video-thumbnailer",
+		"ffmpegthumbnailer",
+		"gdk-pixbuf-thumbnailer",
+		"gnome-desktop-thumbnailer",
+		// Device sync daemons
+		"kdeconnectd",
+		"kio-fuse",
+	}
+	m := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		m[truncateComm(n)] = struct{}{}
+	}
+	return m
+}()
 
 func hasTTY(pid int) bool {
 	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
@@ -410,7 +432,8 @@ func listMountPoints() ([]string, error) {
 	}
 	defer f.Close()
 
-	replacer := strings.NewReplacer(`\\040`, " ", `\\011`, "\t", `\\012`, "\n", `\\134`, `\\`)
+	// mountinfo octal-escapes space, tab, newline, and backslash.
+	replacer := strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`)
 	result := make([]string, 0, 64)
 	s := bufio.NewScanner(f)
 	for s.Scan() {

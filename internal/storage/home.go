@@ -1,10 +1,10 @@
 package storage
 
-import "os"
+import "recents/internal/identity"
 
 func init() {
 	getUserHomeDir = func() string {
-		home, err := os.UserHomeDir()
+		home, err := identity.HomeDir()
 		if err != nil {
 			return ""
 		}
